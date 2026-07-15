@@ -43,6 +43,11 @@ import svgwrite
 import time
 from tracker import ObjectTracker
 
+# -- New imports added by me
+import tflite_runtime.interpreter as tflite
+import cv2
+import database as db
+import mediapipe as mp # for Blaze Face detection
 
 Object = collections.namedtuple('Object', ['id', 'score', 'bbox'])
 
@@ -59,7 +64,7 @@ def shadow_text(dwg, x, y, text, font_size=20):
     dwg.add(dwg.text(text, insert=(x, y), fill='white', font_size=font_size))
 
 
-def generate_svg(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag):
+def generate_svg(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag, identified_people={}):
     dwg = svgwrite.Drawing('', size=src_size)
     src_w, src_h = src_size
     inf_w, inf_h = inference_size
@@ -93,9 +98,17 @@ def generate_svg(src_size, inference_size, inference_box, objs, labels, text_lin
             percent = int(100 * obj.score)
             label = '{}% {} ID:{}'.format(
                 percent, labels.get(obj.id, obj.id), int(trackID))
-            shadow_text(dwg, x, y - 5, label)
+            
             dwg.add(dwg.rect(insert=(x, y), size=(w, h),
                              fill='none', stroke='red', stroke_width='2'))
+            if int(trackID) in identified_people:
+                name = identified_people[int(trackID)]
+                label = '{} (ID: {})'.format(name, int(trackID))
+            else:
+                label = 'ID: {}'.format(int(trackID))
+
+            shadow_text(dwg, x, y - 5, label)
+                
     else:
         for obj in objs:
             x0, y0, x1, y1 = list(obj.bbox)
@@ -141,6 +154,61 @@ def get_output(interpreter, score_threshold, top_k, image_scale=1.0):
                       ymax=np.minimum(1.0, ymax)))
     return [make(i) for i in range(top_k) if scores[i] >= score_threshold]
 
+def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details):
+    #  coordinates between 0 and 1, relative to the input tensor size
+    x0, y0, x1, y1 = td[0].item(), td[1].item(), td[2].item(), td[3].item()
+                    
+    #  current frame as Numpy array
+    camera_image = common.input_tensor(interpreter)
+    img_h, img_w, _ = camera_image.shape
+                        
+    # Convert decimal coordinates to absolute pixel coordinates
+    px0 = max(0, int(x0 * img_w))
+    py0 = max(0, int(y0 * img_h))
+    px1 = min(img_w, int(x1 * img_w))
+    py1 = min(img_h, int(y1 * img_h))
+                        
+    body_crop = camera_image[py0:py1, px0:px1]
+                        
+    if body_crop.size == 0:
+        return None
+        
+    # BlazeFace time
+    results = face_detector.process(body_crop) # already RGB
+
+    if not results.detections:
+        return None
+    
+    # Get the bounding box of the first detected face
+    bbnoxC = results.detections[0].location_data.relative_bounding_box
+    bh, bw, _ = body_crop.shape
+
+    fx0 = max(0, int(bbnoxC.xmin * bw))
+    fy0 = max(0, int(bbnoxC.ymin * bh))
+    fx1 = min(bw, int((bbnoxC.xmin + bbnoxC.width) * bw))
+    fy1 = min(bh, int((bbnoxC.ymin + bbnoxC.height) * bh))
+
+    face_crop = body_crop[fy0:fy1, fx0:fx1]
+
+    if face_crop.size == 0:
+        return None
+    
+    # MobileFaceNet wants 112x112 
+    # for now it's just a crop, but it should be alligned later on
+    face_resized = cv2.resize(face_crop, (112, 112))
+     
+    # this is the same way they normalised the data in the original paper, the internet divides by 127.5,
+    # but I'll stick to the paper
+    face_normalised = (np.float32(face_resized) - 127.5) / 128
+                        
+    # Add the "Batch" dimension (Shape becomes 1, 112, 112, 3)
+    face_input = np.expand_dims(face_normalised, axis=0)
+                        
+    face_interpreter.set_tensor(face_input_details[0]['index'], face_input)
+    face_interpreter.invoke()
+    embedding = face_interpreter.get_tensor(face_output_details[0]['index'])[0]
+                    
+    return embedding 
 
 def main():
     default_model_dir = '../models'
@@ -172,8 +240,26 @@ def main():
 
     w, h, _ = common.input_image_size(interpreter)
     inference_size = (w, h)
+
+    # Load  FaceNet model for face recognition
+    face_interpreter = tflite.Interpreter(model_path="../models/mobilefacenet.tflite")
+    face_interpreter.allocate_tensors()
+    
+    face_input_details = face_interpreter.get_input_details()
+    face_output_details = face_interpreter.get_output_details()
+
+    # Load BlazeFace for face detection
+    
+    mp_face_detection = mp.solutions.face_detection
+    # model_selection = 0 for short-range, 1 for long-range (5 meters is the threshold between short and long range)
+    face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+    
+    face_database = db.load_database()
+
+    identified_people = {}
     # Average fps over last 30 frames.
     fps_counter = common.avg_fps_counter(30)
+    unrecognised_frames = {}
 
     def user_callback(input_tensor, src_size, inference_box, mot_tracker):
         nonlocal fps_counter
@@ -200,6 +286,30 @@ def main():
             if mot_tracker != None:
                 trdata = mot_tracker.update(detections)
                 trackerFlag = True
+            for td in trdata:
+                trackID = int(td[4].item())
+                
+                if trackID in identified_people:
+                    continue  # Skip if already identified
+
+                # Only run face recognition every 5 frames
+                if frames_on_screen % 5 != 1:
+                    continue
+
+                if trackID not in unrecognised_frames:
+                    unrecognised_frames[trackID] = 0
+                unrecognised_frames[trackID] += 1
+                frames_on_screen = unrecognised_frames[trackID]
+
+                embedding = run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details)
+                
+                if embedding is None:
+                    continue
+                    
+                name = db.compare_with_database(embedding, face_database)
+                if name is not None and name != "Unknown":
+                    identified_people[trackID] = name
+                    del unrecognised_frames[trackID]
             text_lines = [
                 'Inference: {:.2f} ms'.format((end_time - start_time) * 1000),
                 'FPS: {} fps'.format(round(next(fps_counter))), ]
