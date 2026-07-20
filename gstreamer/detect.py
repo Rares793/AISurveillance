@@ -47,7 +47,6 @@ from tracker import ObjectTracker
 import tflite_runtime.interpreter as tflite
 import cv2
 import database as db
-import mediapipe as mp # for Blaze Face detection
 
 Object = collections.namedtuple('Object', ['id', 'score', 'bbox'])
 
@@ -173,8 +172,14 @@ def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_det
     if body_crop.size == 0:
         return None
         
-    # BlazeFace time
-    results = face_detector.process(body_crop) # already RGB
+    # Using OpenCV Haar Cascade Face Detection
+    # Haar Cascade needs greyscale
+    gray_crop = cv2.cvtColor(body_crop, cv2.COLOR_RGB2GRAY)
+
+    faces = face_detector.detectMultiScale(gray_crop, scaleFactor=1.1, minNeighbors=4, minSize=(20,20))
+    
+    if len(faces) == 0:
+        return None
 
     if not results.detections:
         return None
@@ -190,6 +195,11 @@ def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_det
 
     face_crop = body_crop[fy0:fy1, fx0:fx1]
 
+    # Grab the first face found
+    fx, fy, fw, fh = faces[0]
+
+    face_crop = body_crop[fy:fy+fh, fx:fx+fw]
+    
     if face_crop.size == 0:
         return None
     
@@ -248,11 +258,16 @@ def main():
     face_input_details = face_interpreter.get_input_details()
     face_output_details = face_interpreter.get_output_details()
 
-    # Load BlazeFace for face detection
+    # Load Haar Cascade which is built-in OpenCV
     
-    mp_face_detection = mp.solutions.face_detection
+    cascade_path = '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml'
+
+    if not os.path.exists(cascade_path):
+        cascade_path = '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml'
+      
+    face_detector = cv2.CascadeClassifier(cascade_path)
     # model_selection = 0 for short-range, 1 for long-range (5 meters is the threshold between short and long range)
-    face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
+    #face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
     
     face_database = db.load_database()
 
