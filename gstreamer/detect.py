@@ -62,8 +62,50 @@ def shadow_text(dwg, x, y, text, font_size=20):
     dwg.add(dwg.text(text, insert=(x+1, y+1), fill='black', font_size=font_size))
     dwg.add(dwg.text(text, insert=(x, y), fill='white', font_size=font_size))
 
-
 def generate_svg(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag, identified_people={}):
+    dw = svgwrite.Drawing('', size=src_size)
+    src_w, src_h = src_size
+    inf_w, inf_h = inference_size
+    box_x, box_y, box_w, box_h = inference_box
+    scale_x, scale_y = src_w / box_w, src_h / box_h
+
+    # Draw the FPS and Latency text in the top left corner
+    for y, line in enumerate(text_lines, start=1):
+        dw.add(dw.text(line, insert=(11, y * 20 + 1), fill='black', font_size='20'))
+        dw.add(dw.text(line, insert=(10, y * 20), fill='white', font_size='20'))
+
+        # If the SORT tracker is running, we use trdata to draw the boxes
+        if trackerFlag and trdata is not None:
+            for td in trdata:
+                # Extract bounding box and the unique ID assigned by SORT
+                x0, y0, x1, y1 = td[0].item(), td[1].item(), td[2].item(), td[3].item()
+                trackID = int(td[4].item())
+
+                # Convert relative coordinates to inference space (300x300)
+                ix0, iy0 = int(x0 * inf_w), int(y0 * inf_h)
+                ix1, iy1 = int(x1 * inf_w), int(y1 * inf_h)
+                
+                # Scale the AI coordinates back to the actual camera resolution
+                px0, py0 = int((ix0 - box_x) * scale_x), int((iy0 - box_y) * scale_y)
+                px1, py1 = int((ix1 - box_x) * scale_x), int((iy1 - box_y) * scale_y)
+
+                # Check if this person's ID has been recognized by FaceNet yet
+                if trackID in identified_people:
+                    name = identified_people[trackID]
+                    display_text = f"{name} (ID: {trackID})"
+                    box_color = 'green'  # green = known person
+                else:
+                    display_text = f"Scanning face... (ID: {trackID})"
+                    box_color = 'red'    # red = unkown person
+
+                # Draw the colored bounding box
+                dw.add(dw.rect(insert=(px0, py0), size=(px1 - px0, py1 - py0), fill='none', stroke=box_color, stroke_width='2'))
+
+                # Draw the Name tag slightly above the box
+                dw.add(dw.text(display_text, insert=(px0, py0 - 10), fill=box_color, font_size='18'))
+    return dw.tostring()
+
+def generate_svg2(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag, identified_people={}):
     dwg = svgwrite.Drawing('', size=src_size)
     src_w, src_h = src_size
     inf_w, inf_h = inference_size
@@ -181,20 +223,6 @@ def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_det
     if len(faces) == 0:
         return None
 
-    if not results.detections:
-        return None
-    
-    # Get the bounding box of the first detected face
-    bbnoxC = results.detections[0].location_data.relative_bounding_box
-    bh, bw, _ = body_crop.shape
-
-    fx0 = max(0, int(bbnoxC.xmin * bw))
-    fy0 = max(0, int(bbnoxC.ymin * bh))
-    fx1 = min(bw, int((bbnoxC.xmin + bbnoxC.width) * bw))
-    fy1 = min(bh, int((bbnoxC.ymin + bbnoxC.height) * bh))
-
-    face_crop = body_crop[fy0:fy1, fx0:fx1]
-
     # Grab the first face found
     fx, fy, fw, fh = faces[0]
 
@@ -202,7 +230,8 @@ def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_det
     
     if face_crop.size == 0:
         return None
-    
+
+    print(f"[Debug] Haar found a face!")
     # MobileFaceNet wants 112x112 
     # for now it's just a crop, but it should be alligned later on
     face_resized = cv2.resize(face_crop, (112, 112))
@@ -260,7 +289,7 @@ def main():
 
     # Load Haar Cascade which is built-in OpenCV
     
-    cascade_path = '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml'
+    cascade_path = 'haarcascade_frontalface_default.xml'
 
     if not os.path.exists(cascade_path):
         cascade_path = '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml'
@@ -270,7 +299,8 @@ def main():
     #face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
     
     face_database = db.load_database()
-
+    db.scan_folder(face_database)
+        
     identified_people = {}
     # Average fps over last 30 frames.
     fps_counter = common.avg_fps_counter(30)
@@ -297,6 +327,7 @@ def main():
         detections = np.array(detections)
         trdata = []
         trackerFlag = False
+        text_lines = ['Inference: {:.2f} ms'.format((end_time - start_time) * 1000),'FPS: {} fps'.format(round(next(fps_counter))),]
         if detections.any():
             if mot_tracker != None:
                 trdata = mot_tracker.update(detections)
@@ -306,30 +337,31 @@ def main():
                 
                 if trackID in identified_people:
                     continue  # Skip if already identified
-
-                # Only run face recognition every 5 frames
-                if frames_on_screen % 5 != 1:
-                    continue
-
+                    
                 if trackID not in unrecognised_frames:
                     unrecognised_frames[trackID] = 0
                 unrecognised_frames[trackID] += 1
                 frames_on_screen = unrecognised_frames[trackID]
 
+                if frames_on_screen % 5 != 1:
+                    continue
+
                 embedding = run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details)
-                
+
                 if embedding is None:
                     continue
                     
-                name = db.compare_with_database(embedding, face_database)
+                name, distance = db.compare_with_database(embedding, face_database)
+                
                 if name is not None and name != "Unknown":
                     identified_people[trackID] = name
+                    print(f"\n[AI MATCH] Person Identified! ID {trackID} is {name} (Distance: {distance:.2f})")
                     del unrecognised_frames[trackID]
             text_lines = [
                 'Inference: {:.2f} ms'.format((end_time - start_time) * 1000),
                 'FPS: {} fps'.format(round(next(fps_counter))), ]
-        if len(objs) != 0:
-            return generate_svg(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag)
+        #if len(objs) != 0:
+        return generate_svg(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag, identified_people)
 
     result = gstreamer.run_pipeline(user_callback,
                                     src_size=(640, 480),
