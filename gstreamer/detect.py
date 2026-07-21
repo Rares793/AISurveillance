@@ -195,60 +195,82 @@ def get_output(interpreter, score_threshold, top_k, image_scale=1.0):
                       ymax=np.minimum(1.0, ymax)))
     return [make(i) for i in range(top_k) if scores[i] >= score_threshold]
 
-def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details):
-    #  coordinates between 0 and 1, relative to the input tensor size
+# This currently uses just Haar Cascade
+def detect_and_crop_face(image, face_detector):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
+
+    if len(faces) == 0:
+        return None
+
+    largest_face = max(faces, key=lambda f: f[2]*f[3])
+    x, y, w, h = largest_face
+    cropped_face = image[y:y+h, x:x+w]
+    return cropped_face
+
+def get_body_crop(td, interpreter):
+    # coordinates between 0 and 1, relative to input tensor size
     x0, y0, x1, y1 = td[0].item(), td[1].item(), td[2].item(), td[3].item()
-                    
-    #  current frame as Numpy array
-    camera_image = common.input_tensor(interpreter)
-    img_h, img_w, _ = camera_image.shape
-                        
+
+    # get current frame as a NumPy array
+    camera_img = common.input_tensor(interpreter)
+    img_h, img_w, _ =  camera_img.shape
+
     # Convert decimal coordinates to absolute pixel coordinates
     px0 = max(0, int(x0 * img_w))
     py0 = max(0, int(y0 * img_h))
     px1 = min(img_w, int(x1 * img_w))
     py1 = min(img_h, int(y1 * img_h))
-                        
-    body_crop = camera_image[py0:py1, px0:px1]
-                        
+
+    body_crop = camera_img[py0:py1, px0:px1]
+
     if body_crop.size == 0:
         return None
-        
-    # Using OpenCV Haar Cascade Face Detection
-    # Haar Cascade needs greyscale
-    gray_crop = cv2.cvtColor(body_crop, cv2.COLOR_RGB2GRAY)
+    return body_crop
 
-    faces = face_detector.detectMultiScale(gray_crop, scaleFactor=1.1, minNeighbors=4, minSize=(20,20))
-    
-    if len(faces) == 0:
-        return None
-
-    # Grab the first face found
-    fx, fy, fw, fh = faces[0]
-
-    face_crop = body_crop[fy:fy+fh, fx:fx+fw]
-    
-    if face_crop.size == 0:
-        return None
-
-    print(f"[Debug] Haar found a face!")
-    # MobileFaceNet wants 112x112 
-    # for now it's just a crop, but it should be alligned later on
+def pre_process_face(face_crop):
     face_resized = cv2.resize(face_crop, (112, 112))
-     
-    # this is the same way they normalised the data in the original paper, the internet divides by 127.5,
-    # but I'll stick to the paper
+
+    # the original paper normalised its data as such, the internet sometimes just divides by 255
     face_normalised = (np.float32(face_resized) - 127.5) / 128
-                        
-    # Add the "Batch" dimension (Shape becomes 1, 112, 112, 3)
     face_input = np.expand_dims(face_normalised, axis=0)
-                        
-    face_interpreter.set_tensor(face_input_details[0]['index'], face_input)
+
+    return face_input
+    
+def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details):
+    body_crop = get_body_crop(td, interpreter)
+
+    if body_crop is None:
+        return None
+        
+    face_crop = detect_and_crop_face(body_crop, face_detector)
+
+    if face_crop is not None:
+        print(f"[Debug] Haar found a face!")
+    else:
+        return None
+        
+    face = pre_process_face(face_crop)
+    
+    face_interpreter.set_tensor(face_input_details[0]['index'], face)
     face_interpreter.invoke()
     embedding = face_interpreter.get_tensor(face_output_details[0]['index'])[0]
                     
     return embedding 
 
+def print_face_fingerprint(name, embedding):
+    print(f"Name: {name}")
+    num_features = embedding.shape[0] if len(embedding.shape) > 0 else len(embedding)
+    print(f"Array Shape: {embedding.shape} (It has {num_features} unique features)")
+    print(f"Data Type: {embedding.dtype}")
+    print(f"{num_features} dimensional coordinates:")
+
+    formatted_nums = [f"{num: 6.4f}" for num in embedding]
+
+    for i in range(0, len(formatted_nums), 8):
+        row = " | ".join(formatted_nums[i:i+8])
+        print(f" [ {row} ]")
+        
 def main():
     default_model_dir = '../models'
     default_model = 'mobilenet_ssd_v2_coco_quant_postprocess_edgetpu.tflite'
@@ -305,9 +327,11 @@ def main():
     # Average fps over last 30 frames.
     fps_counter = common.avg_fps_counter(30)
     unrecognised_frames = {}
-
+    print_face_fingerprint("Rares", np.array(face_database["Rares"]))
+    test_variable = 0
     def user_callback(input_tensor, src_size, inference_box, mot_tracker):
         nonlocal fps_counter
+        nonlocal test_variable
         start_time = time.monotonic()
         common.set_input(interpreter, input_tensor)
         interpreter.invoke()
@@ -352,6 +376,10 @@ def main():
                     continue
                     
                 name, distance = db.compare_with_database(embedding, face_database)
+
+                if test_variable < 2:
+                    print_face_fingerprint(name, embedding)
+                    test_variable = test_variable + 1
                 
                 if name is not None and name != "Unknown":
                     identified_people[trackID] = name
