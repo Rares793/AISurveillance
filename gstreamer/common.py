@@ -13,13 +13,14 @@
 # limitations under the License.
 
 """Common utilities."""
+import tflite_runtime.interpreter as tflite
 import collections
 import gi
 gi.require_version('Gst', '1.0')
 from gi.repository import Gst
 import numpy as np
 import svgwrite
-import tflite_runtime.interpreter as tflite
+#import tflite_runtime.interpreter as tflite
 import time
 
 EDGETPU_SHARED_LIB = 'libedgetpu.so.1'

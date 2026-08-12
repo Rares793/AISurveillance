@@ -76,7 +76,7 @@ def main():
 
         save_dir = 'new_faces'
         if not os.path.exists(save_dir):
-            os.makedirs(save_fir)
+            os.makedirs(save_dir)
 
         filepath = os.path.join(save_dir, f"{name}.jpg")
         cv2.imwrite(filepath, captured_img)

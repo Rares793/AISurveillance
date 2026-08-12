@@ -5,6 +5,7 @@ import json
 import cv2
 import numpy as np
 import tflite_runtime.interpreter as tflite
+import utilities as ut
 
 # --- Configuration ---
 DB_FILE = 'face_database.json'
@@ -27,27 +28,32 @@ def save_database(db):
     with open(DB_FILE, 'w') as f:
         json.dump(raw_db, f, indent=4)
 
-# it's seperate from the direct implementation in detect.py because it doesn't need realingment 
-def get_embedding(image_path, interpreter, input_details, output_details):
-    # Reads an image, formats it, and extracts the 128-number fingerprint
-    img = cv2.imread(image_path)
-    if img is None:
+# well, it was a TEMPORARY solution, but eh 
+def get_embedding(image_path, interpreter, input_details, output_details, detector):
+    # Reads an image, formats it, and extracts the 192-number fingerprint
+    img_bgr = cv2.imread(image_path)
+    if img_bgr is None:
         return None
-        
+
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     # MobileFaceNet wants 112x112 
-    img_resized = cv2.resize(img, (112, 112))
+
+    if detector is not None:
+        face_crop = ut.detect_and_crop_face(img, detector)
     
-    # Paper uses: (pixel - 127.5) / 128.0
-    img_normalized = (np.float32(img_resized) - 127.5) / 128.0
+        if face_crop is None:
+            print("[Debug] No face found in picture")
+            return None
     
-    # Add the batch dimension: Shape becomes (1, 112, 112, 3)
-    img_input = np.expand_dims(img_normalized, axis=0)
-    
+        img_input = ut.pre_process_face(face_crop)
+    else:
+        img_input = ut.pre_process_face(img)
+        
     # Run the model
     interpreter.set_tensor(input_details[0]['index'], img_input)
     interpreter.invoke()
     
-    # Return the 128-number array
+    # Return the 192-number array
     return interpreter.get_tensor(output_details[0]['index'])[0]
 
 def compare_with_database(new_embedding, db, threshold=MATCH_THRESHOLD):
@@ -69,7 +75,7 @@ def compare_with_database(new_embedding, db, threshold=MATCH_THRESHOLD):
     return None, lowest_distance
 
 # It will update the face_db if it adds something new so no need to reinitialize it after every scan
-def scan_folder(face_db):
+def scan_folder(face_db, detector):
     # Main function to scan the folder, update the D and delete images to not waste space
     # Create the folder if it doesn't exist
     if not os.path.exists(NEW_FACES_DIR):
@@ -94,7 +100,7 @@ def scan_folder(face_db):
         name = os.path.splitext(filename)[0] 
         
         print(f"\nProcessing {filename}...")
-        embedding = get_embedding(filepath, interpreter, input_details, output_details)
+        embedding = get_embedding(filepath, interpreter, input_details, output_details, detector)
         
         if embedding is None:
             print(f"  -> Error: Could not read image. Skipping.")

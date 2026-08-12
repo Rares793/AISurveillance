@@ -47,6 +47,8 @@ from tracker import ObjectTracker
 import tflite_runtime.interpreter as tflite
 import cv2
 import database as db
+import mediapipe as mp
+import utilities as ut
 
 Object = collections.namedtuple('Object', ['id', 'score', 'bbox'])
 
@@ -105,7 +107,7 @@ def generate_svg(src_size, inference_size, inference_box, objs, labels, text_lin
                 dw.add(dw.text(display_text, insert=(px0, py0 - 10), fill=box_color, font_size='18'))
     return dw.tostring()
 
-def generate_svg2(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag, identified_people={}):
+def generate_svg_original(src_size, inference_size, inference_box, objs, labels, text_lines, trdata, trackerFlag, identified_people={}):
     dwg = svgwrite.Drawing('', size=src_size)
     src_w, src_h = src_size
     inf_w, inf_h = inference_size
@@ -193,84 +195,34 @@ def get_output(interpreter, score_threshold, top_k, image_scale=1.0):
                       ymin=np.maximum(0.0, ymin),
                       xmax=np.minimum(1.0, xmax),
                       ymax=np.minimum(1.0, ymax)))
-    return [make(i) for i in range(top_k) if scores[i] >= score_threshold]
+    return [make(i) for i in range(top_k) if scores[i] >= score_threshold and int(category_ids[i]) == 0]
 
-# This currently uses just Haar Cascade
-def detect_and_crop_face(image, face_detector):
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    faces = face_detector.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30,30))
-
-    if len(faces) == 0:
-        return None
-
-    largest_face = max(faces, key=lambda f: f[2]*f[3])
-    x, y, w, h = largest_face
-    cropped_face = image[y:y+h, x:x+w]
-    return cropped_face
-
-def get_body_crop(td, interpreter):
-    # coordinates between 0 and 1, relative to input tensor size
-    x0, y0, x1, y1 = td[0].item(), td[1].item(), td[2].item(), td[3].item()
-
-    # get current frame as a NumPy array
-    camera_img = common.input_tensor(interpreter)
-    img_h, img_w, _ =  camera_img.shape
-
-    # Convert decimal coordinates to absolute pixel coordinates
-    px0 = max(0, int(x0 * img_w))
-    py0 = max(0, int(y0 * img_h))
-    px1 = min(img_w, int(x1 * img_w))
-    py1 = min(img_h, int(y1 * img_h))
-
-    body_crop = camera_img[py0:py1, px0:px1]
-
-    if body_crop.size == 0:
-        return None
-    return body_crop
-
-def pre_process_face(face_crop):
-    face_resized = cv2.resize(face_crop, (112, 112))
-
-    # the original paper normalised its data as such, the internet sometimes just divides by 255
-    face_normalised = (np.float32(face_resized) - 127.5) / 128
-    face_input = np.expand_dims(face_normalised, axis=0)
-
-    return face_input
     
-def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details):
-    body_crop = get_body_crop(td, interpreter)
+def run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details, apply_blur, debug_messages):
+    body_crop = ut.get_body_crop(td, interpreter)
 
     if body_crop is None:
         return None
-        
-    face_crop = detect_and_crop_face(body_crop, face_detector)
 
-    if face_crop is not None:
-        print(f"[Debug] Haar found a face!")
-    else:
+    if apply_blur:
+        body_crop = cv2.GaussianBlur(body_crop, (3, 3), 0)
+        
+    face_crop = ut.detect_and_crop_face(body_crop, face_detector)
+
+    if face_crop is None:
         return None
         
-    face = pre_process_face(face_crop)
+    if debug_messages:
+        print(f"[Debug] Found a face!")
+        
+    face = ut.pre_process_face(face_crop)
     
     face_interpreter.set_tensor(face_input_details[0]['index'], face)
     face_interpreter.invoke()
     embedding = face_interpreter.get_tensor(face_output_details[0]['index'])[0]
                     
     return embedding 
-
-def print_face_fingerprint(name, embedding):
-    print(f"Name: {name}")
-    num_features = embedding.shape[0] if len(embedding.shape) > 0 else len(embedding)
-    print(f"Array Shape: {embedding.shape} (It has {num_features} unique features)")
-    print(f"Data Type: {embedding.dtype}")
-    print(f"{num_features} dimensional coordinates:")
-
-    formatted_nums = [f"{num: 6.4f}" for num in embedding]
-
-    for i in range(0, len(formatted_nums), 8):
-        row = " | ".join(formatted_nums[i:i+8])
-        print(f" [ {row} ]")
-        
+                
 def main():
     default_model_dir = '../models'
     default_model = 'mobilenet_ssd_v2_coco_quant_postprocess_edgetpu.tflite'
@@ -292,6 +244,11 @@ def main():
     parser.add_argument('--tracker', help='Name of the Object Tracker To be used.',
                         default=None,
                         choices=[None, 'sort'])
+    parser.add_argument('--detector', help='Name of the Face Detector To be used',
+                        default=None,
+                        choices=[None, 'haar', 'blazeface'])
+    parser.add_argument('--blur', action='store_true', help = "Apply a 3x3 Gaussian Blur to help with camera noise")
+    parser.add_argument('--debug_messages', action='store_true', help = "Enable some [Debug] messages")
     args = parser.parse_args()
 
     print('Loading {} with {} labels.'.format(args.model, args.labels))
@@ -309,26 +266,20 @@ def main():
     face_input_details = face_interpreter.get_input_details()
     face_output_details = face_interpreter.get_output_details()
 
-    # Load Haar Cascade which is built-in OpenCV
-    
-    cascade_path = 'haarcascade_frontalface_default.xml'
+    face_detector = ut.load_face_detector(args.detector)
 
-    if not os.path.exists(cascade_path):
-        cascade_path = '/usr/share/opencv/haarcascades/haarcascade_frontalface_default.xml'
-      
-    face_detector = cv2.CascadeClassifier(cascade_path)
-    # model_selection = 0 for short-range, 1 for long-range (5 meters is the threshold between short and long range)
-    #face_detector = mp_face_detection.FaceDetection(model_selection=0, min_detection_confidence=0.5)
-    
     face_database = db.load_database()
-    db.scan_folder(face_database)
+    db.scan_folder(face_database, face_detector)
         
     identified_people = {}
     # Average fps over last 30 frames.
     fps_counter = common.avg_fps_counter(30)
     unrecognised_frames = {}
-    print_face_fingerprint("Rares", np.array(face_database["Rares"]))
+    if args.debug_messages:
+        ut.print_face_fingerprint("Rares", np.array(face_database["Rares"]))
+        
     test_variable = 0
+    
     def user_callback(input_tensor, src_size, inference_box, mot_tracker):
         nonlocal fps_counter
         nonlocal test_variable
@@ -362,7 +313,7 @@ def main():
                 if trackID in identified_people:
                     continue  # Skip if already identified
                     
-                if trackID not in unrecognised_frames:
+                if trackID not in unrecognised_frames: # since unrecognised_frames isn't nonlocal, it runs every frame but eh
                     unrecognised_frames[trackID] = 0
                 unrecognised_frames[trackID] += 1
                 frames_on_screen = unrecognised_frames[trackID]
@@ -370,16 +321,15 @@ def main():
                 if frames_on_screen % 5 != 1:
                     continue
 
-                embedding = run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details)
+                embedding = run_facenet(td, interpreter, face_detector, face_interpreter, face_input_details, face_output_details, args.blur, args.debug_messages)
 
                 if embedding is None:
                     continue
                     
                 name, distance = db.compare_with_database(embedding, face_database)
 
-                if test_variable < 2:
-                    print_face_fingerprint(name, embedding)
-                    test_variable = test_variable + 1
+                if args.debug_messages:
+                    ut.print_face_fingerprint(name, embedding)
                 
                 if name is not None and name != "Unknown":
                     identified_people[trackID] = name
