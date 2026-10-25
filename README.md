@@ -66,3 +66,5 @@ The overlay shows inference time and FPS in the top-left corner.
 - Original example code: Copyright 2019 Google LLC, Apache License 2.0 (see `LICENSE`).
 - [SORT](https://github.com/abewley/sort) by Alex Bewley, GPLv3, in `third_party/`.
 - MobileFaceNet is used for face embeddings.
+
+And a very special thank you to the mentor who helped me out with this project, Jeong Pangyu, who was more patient than he should have been with me throughout the duration of my summer practice at the company he worked at.
