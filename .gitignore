@@ -1,2 +1,4 @@
 all_models/
 **__pycache__
+face_database.json
+new_faces/
